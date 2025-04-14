@@ -101,6 +101,7 @@ public class ConfigFileReaderWriter {
     private final @NotNull ProtocolAdapterExtractor protocolAdapterExtractor;
     private final @NotNull DataCombiningExtractor dataCombiningExtractor;
     private final @NotNull UnsExtractor unsExtractor;
+    private final @NotNull List<ReloadableExtractor> reloadableExtractors;
 
     private final @NotNull AtomicLong lastWrite = new AtomicLong(0L);
 
@@ -113,6 +114,11 @@ public class ConfigFileReaderWriter {
         this.protocolAdapterExtractor = new ProtocolAdapterExtractor(this);
         this.dataCombiningExtractor = new DataCombiningExtractor(this);
         this.unsExtractor = new UnsExtractor(this);
+        reloadableExtractors = List.of(
+                bridgeExtractor,
+                protocolAdapterExtractor,
+                dataCombiningExtractor,
+                unsExtractor);
     }
 
     public HiveMQConfigEntity applyConfig() {
@@ -124,7 +130,10 @@ public class ConfigFileReaderWriter {
         final File configFile = configurationFile.file().get();
         final HiveMQConfigEntity hiveMQConfigEntity = readConfigFromXML(configFile);
         this.configEntity = hiveMQConfigEntity;
-        setConfiguration(hiveMQConfigEntity);
+        if(!setConfiguration(hiveMQConfigEntity)) {
+            log.error("Unable to apply the given configuration.");
+            throw new UnrecoverableException(false);
+        }
 
         return hiveMQConfigEntity;
     }
@@ -515,11 +524,46 @@ public class ConfigFileReaderWriter {
 
         if (requiresRestart.isEmpty()) {
             log.debug("Config can be applied");
-            configurators.forEach(c -> c.applyConfig(config));
-            bridgeExtractor.updateConfig(config);
-            protocolAdapterExtractor.updateConfig(config);
-            dataCombiningExtractor.updateConfig(config);
-            unsExtractor.updateConfig(config);
+            for (final Configurator<?> configurator : configurators) {
+                final @Nullable Configurator.ConfigResult configResult = configurator.applyConfig(config);
+                if (configResult == null) {
+                    log.error("Config {} can not be applied because the result is not found.",
+                            configurator.getClass().getSimpleName());
+                    return false;
+                }
+                switch (configResult) {
+                    case ERROR -> {
+                        log.error("Config {} can not be applied because an unrecoverable error is found.",
+                                configurator.getClass().getSimpleName());
+                        return false;
+                    }
+                    case NEEDS_RESTART -> {
+                        log.error("Config {} can not be applied because it requires restart.",
+                                configurator.getClass().getSimpleName());
+                        return false;
+                    }
+                }
+            }
+            for (final ReloadableExtractor<?, ?> reloadableExtractor : reloadableExtractors) {
+                final @Nullable Configurator.ConfigResult configResult = reloadableExtractor.updateConfig(config);
+                if (configResult == null) {
+                    log.error("Reloadable config {} can not be applied because the result is not found.",
+                            reloadableExtractor.getClass().getSimpleName());
+                    return false;
+                }
+                switch (configResult) {
+                    case ERROR -> {
+                        log.error("Reloadable config {} can not be applied because an unrecoverable error is found.",
+                                reloadableExtractor.getClass().getSimpleName());
+                        return false;
+                    }
+                    case NEEDS_RESTART -> {
+                        log.error("Reloadable config {} can not be applied because it requires restart.",
+                                reloadableExtractor.getClass().getSimpleName());
+                        return false;
+                    }
+                }
+            }
             return true;
         } else {
             log.error("Config requires restart because of: {}", requiresRestart);
@@ -533,11 +577,7 @@ public class ConfigFileReaderWriter {
         configurators.stream()
                 .filter(c -> c instanceof Syncable)
                 .forEach(c -> ((Syncable)c).sync(configEntity));
-
-        bridgeExtractor.sync(configEntity);
-        protocolAdapterExtractor.sync(configEntity);
-        dataCombiningExtractor.sync(configEntity);
-        unsExtractor.sync(configEntity);
+        reloadableExtractors.forEach(reloadableExtractor -> reloadableExtractor.sync(configEntity));
     }
 
     protected Schema loadSchema() throws IOException, SAXException {
